@@ -1,0 +1,12 @@
+:root{--bg:#0f1724;--card:#0b1220;--muted:#9aa4b2}
+body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto;background:linear-gradient(180deg,#071021,#0b1220);color:#e6eef6}
+.nav{display:flex;justify-content:space-between;padding:12px 20px;align-items:center;background:rgba(255,255,255,0.02)}
+.brand{font-weight:700}
+.links a, .links button{margin-left:12px;color:#d6e7ff;text-decoration:none;background:none;border:none;cursor:pointer}
+.center-card{display:flex;justify-content:center;padding:40px}
+.card{background:rgba(255,255,255,0.03);padding:20px;border-radius:12px;min-width:320px}
+input{display:block;width:100%;padding:10px;margin:8px 0;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:#fff}
+button{padding:10px 14px;border-radius:8px;border:none;background:#2dd4bf;color:#022;cursor:pointer}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:16px}
+.txn-row{padding:10px;border-bottom:1px solid rgba(255,255,255,0.03)}
+.user-row{padding:8px;border-bottom:1px solid rgba(255,255,255,0.03)}
