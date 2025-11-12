@@ -26,112 +26,88 @@ function makeFallback() {
 }
 
 const RAW_URL = (process.env.REDIS_URL || '').trim();
-if (!RAW_URL) {
-  console.warn('[cache] REDIS_URL not set — using in-memory fallback cache');
-  const fallback = makeFallback();
-  export default fallback;
-}
+const MAX_CONSECUTIVE_FAILURES = 5;
 
 let client = null;
-let fallback = null;
-
-const MAX_FAILURES = 5;
-let consecutiveFailures = 0;
+let fallback = makeFallback();
 let usingFallback = false;
+let consecutiveFailures = 0;
 
-function createClient(url) {
-  // configure options for resiliency
+function createRedisClient(url) {
   const opts = {
     lazyConnect: true,
     connectTimeout: 10000,
-    maxRetriesPerRequest: null, // allow retrying behavior via retryStrategy
+    // null means unlimited retries controlled by retryStrategy
+    maxRetriesPerRequest: null,
     retryStrategy(times) {
-      if (times > 20) return null; // stop retrying after many attempts
+      if (times > 50) return null;
       return Math.min(200 + times * 200, 20000);
     },
     reconnectOnError(err) {
-      // recoverable network errors: let ioredis try to reconnect
-      const message = (err && err.message) ? err.message : '';
-      if (message.includes('READONLY')) return false;
+      const msg = err && err.message ? err.message : '';
+      // If server says READONLY (common on some managed providers), don't reconnect
+      if (msg.includes('READONLY')) return false;
       return true;
-    },
-    // For TLS URLs (rediss://) ioredis handles the tls flag automatically.
-    // If you need to relax TLS validation (not recommended), pass tls:{ rejectUnauthorized:false }
+    }
   };
 
-  const c = new Redis(url, opts);
+  const r = new Redis(url, opts);
 
-  // Attach handlers immediately to avoid "Unhandled error event"
-  c.on('error', (err) => {
-    console.error('[ioredis] error:', err && err.message ? err.message : err);
+  r.on('error', (err) => {
+    try {
+      console.error('[ioredis] error:', err && err.message ? err.message : err);
+    } catch (e) {}
     consecutiveFailures += 1;
-    if (consecutiveFailures >= MAX_FAILURES && !usingFallback) {
-      console.error('[ioredis] too many failures - switching to in-memory fallback');
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES && !usingFallback) {
+      console.error('[cache] too many redis failures, switching to in-memory fallback');
       try {
-        fallback = makeFallback();
         usingFallback = true;
-        // close the redis client gracefully
-        c.disconnect();
+        r.disconnect();
         client = null;
       } catch (e) {
-        console.error('[ioredis] error while switching to fallback', e && e.message ? e.message : e);
+        console.error('[cache] error while disconnecting redis', e && e.message ? e.message : e);
       }
     }
   });
 
-  c.on('connect', () => {
-    console.log('[ioredis] connecting');
-  });
+  r.on('connect', () => console.log('[ioredis] connecting'));
+  r.on('ready', () => { console.log('[ioredis] ready'); consecutiveFailures = 0; });
+  r.on('close', () => console.warn('[ioredis] closed'));
+  r.on('end', () => console.warn('[ioredis] ended'));
 
-  c.on('ready', () => {
-    console.log('[ioredis] ready');
-    consecutiveFailures = 0;
-  });
-
-  c.on('close', () => {
-    console.warn('[ioredis] closed');
-  });
-
-  c.on('end', () => {
-    console.warn('[ioredis] connection ended');
-  });
-
-  return c;
+  return r;
 }
 
-client = createClient(RAW_URL);
-
-// attempt connect but don't throw if it fails (lazyConnect=false would throw)
-(async () => {
-  try {
-    await client.connect();
-    // once connected, do a ping to confirm
-    const pong = await client.ping();
-    console.log('[ioredis] ping ->', pong);
-    consecutiveFailures = 0;
-  } catch (err) {
-    console.error('[ioredis] initial connect/ping failed:', err && err.message ? err.message : err);
-    consecutiveFailures += 1;
-    if (consecutiveFailures >= MAX_FAILURES) {
-      console.error('[ioredis] switching to in-memory fallback due to repeated failures');
-      try {
-        client.disconnect();
-      } catch (e) {}
-      fallback = makeFallback();
-      usingFallback = true;
-      client = null;
+if (!RAW_URL) {
+  console.warn('[cache] REDIS_URL not set — using in-memory fallback');
+  usingFallback = true;
+  client = null;
+} else {
+  client = createRedisClient(RAW_URL);
+  (async () => {
+    try {
+      await client.connect();
+      const pong = await client.ping();
+      console.log('[ioredis] ping ->', pong);
+      consecutiveFailures = 0;
+    } catch (err) {
+      console.error('[ioredis] initial connect/ping failed:', err && err.message ? err.message : err);
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error('[cache] switching to in-memory fallback due to repeated failures');
+        try { await client.disconnect(); } catch(e){/*ignore*/ }
+        client = null;
+        usingFallback = true;
+      }
     }
-  }
-})();
+  })();
+}
 
-// exported wrapper that delegates to redis client or fallback
 const api = {
   get: async (k) => {
-    if (usingFallback) return fallback.get(k);
-    if (!client) return null;
+    if (usingFallback || !client) return fallback.get(k);
     try {
-      const v = await client.get(k);
-      return v;
+      return await client.get(k);
     } catch (e) {
       console.error('[cache.get] error', e && e.message ? e.message : e);
       return null;
@@ -139,8 +115,7 @@ const api = {
   },
 
   set: async (k, v, mode, ttl) => {
-    if (usingFallback) return fallback.set(k, v, mode, ttl);
-    if (!client) return null;
+    if (usingFallback || !client) return fallback.set(k, v, mode, ttl);
     try {
       if (mode && /EX/i.test(mode) && typeof ttl === 'number') {
         return await client.set(k, v, 'EX', ttl);
@@ -153,8 +128,7 @@ const api = {
   },
 
   del: async (k) => {
-    if (usingFallback) return fallback.del(k);
-    if (!client) return 0;
+    if (usingFallback || !client) return fallback.del(k);
     try {
       return await client.del(k);
     } catch (e) {
@@ -165,20 +139,16 @@ const api = {
 
   disconnect: async () => {
     if (client) {
-      try {
-        await client.disconnect();
-      } catch (e) {
-        console.error('[cache.disconnect] error', e && e.message ? e.message : e);
-      }
+      try { await client.disconnect(); } catch (e) { console.error('[cache.disconnect] error', e && e.message ? e.message : e); }
     }
   },
 
-  on: (event, handler) => {
-    if (client) client.on(event, handler);
-    if (fallback && fallback.on) fallback.on(event, handler);
+  on: (evt, h) => {
+    if (client) client.on(evt, h);
+    if (fallback && fallback.on) fallback.on(evt, h);
   },
 
-  _isUsingFallback: () => usingFallback
+  _usingFallback: () => usingFallback
 };
 
 export default api;
